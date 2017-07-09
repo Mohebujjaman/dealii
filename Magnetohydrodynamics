@@ -1,1 +1,1374 @@
 
+
+/* ---------------------------------------------------------------------
+ * 07/09/2017  SECOND ORDER TEMPORAL CONVERGENCE TEST FOR MAGNETOHYDRODYNAMIC (MHD) FLOWS
+ * 
+ *   Author: Muhammad Mohebujjaman (Navier-Stokes to Magnetohydrodynamics)
+ * This program deals with the time dependent Magnetohydrodynamic (MHD) system of equations. 
+ * At first we used Els\"{a}sser formulation transforming the velocity and magnetic field 
+ * variables to the Els\"{a}sser variables. We used here the proposed decoupled second order
+ * scheme by Li and Trenchea. To test the temporal convergence of the scheme we used a fixed
+ * small spatial step size h=1/64 and end time T=1. We consider a unit square [0,1] by [0,1] 
+ * a our domain. We know from the theory that the scheme is unconditionally stable when the 
+ * magnetic Prandtl number Pr_m:=\nu/\nu_m is in betwen 1/2 and 2. For this particular test,
+ * we are using viscosity \nu = 1 and magnetic resistivity \nu_m=1. (Q_2,Q_1) Taylor hood
+ * stable pair were used
+ */
+
+
+// @sect3{Include files}
+
+// As usual, we start by including some well-known files:
+
+#include <deal.II/base/quadrature_lib.h>
+#include <deal.II/base/logstream.h>
+#include <deal.II/base/function.h>
+#include <deal.II/base/utilities.h>
+
+#include <deal.II/lac/block_vector.h>
+#include <deal.II/lac/full_matrix.h>
+#include <deal.II/lac/block_sparse_matrix.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/precondition.h>
+#include <deal.II/lac/constraint_matrix.h>
+
+#include <deal.II/grid/tria.h>
+#include <deal.II/grid/grid_generator.h>
+#include <deal.II/grid/tria_accessor.h>
+#include <deal.II/grid/tria_iterator.h>
+#include <deal.II/grid/tria_boundary_lib.h>
+#include <deal.II/grid/grid_tools.h>
+#include <deal.II/grid/grid_refinement.h>
+
+#include <deal.II/dofs/dof_handler.h>
+#include <deal.II/dofs/dof_renumbering.h>
+#include <deal.II/dofs/dof_accessor.h>
+#include <deal.II/dofs/dof_tools.h>
+
+#include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_system.h>
+#include <deal.II/fe/fe_values.h>
+
+#include <deal.II/numerics/vector_tools.h>
+#include <deal.II/numerics/matrix_tools.h>
+#include <deal.II/numerics/data_out.h>
+#include <deal.II/numerics/error_estimator.h>
+#include <deal.II/base/convergence_table.h>
+// Then we need to include the header file for the sparse direct solver
+// UMFPACK:
+#include <deal.II/lac/sparse_direct.h>
+
+// This includes the library for the incomplete LU factorization that will be
+// used as a preconditioner in 3D:
+#include <deal.II/lac/sparse_ilu.h>
+
+// This is C++:
+#include <fstream>
+#include <sstream>
+
+
+// As in all programs, the namespace dealii is included:
+namespace MHD
+{
+  using namespace dealii;
+
+  // @sect3{Defining the inner preconditioner type}
+
+  // As explained in the introduction, we are going to use different
+  // preconditioners for two and three space dimensions, respectively. We
+  // distinguish between them by the use of the spatial dimension as a
+  // template parameter. See step-4 for details on templates. We are not going
+  // to create any preconditioner object here, all we do is to create class
+  // that holds a local typedef determining the preconditioner class so we can
+  // write our program in a dimension-independent way.
+  template <int dim>
+  struct InnerPreconditioner;
+
+  // In 2D, we are going to use a sparse direct solver as preconditioner:
+  template <>
+  struct InnerPreconditioner<2>
+  {
+    typedef SparseDirectUMFPACK type;
+  };
+
+  // And the ILU preconditioning in 3D, called by SparseILU:
+  template <>
+  struct InnerPreconditioner<3>
+  {
+    typedef SparseILU<double> type;
+  };
+
+
+  // @sect3{The <code>StokesProblem</code> class template}
+
+  // This is an adaptation of step-20, so the main class and the data types
+  // are the same as used there. In this example we also use adaptive grid
+  // refinement, which is handled in analogy to step-6. According to the
+  // discussion in the introduction, we are also going to use the
+  // ConstraintMatrix for implementing Dirichlet boundary conditions. Hence,
+  // we change the name <code>hanging_node_constraints</code> into
+  // <code>constraints</code>.
+
+  namespace EquationData{
+    template <int dim>
+    class BoundaryValues_w : public Function<dim>
+    {
+      public:
+      BoundaryValues_w () : Function<dim>(dim+1) {}
+
+      virtual double value (const Point<dim>   &p,
+                          const unsigned int  component = 0) const;
+
+      virtual void vector_value (const Point<dim> &p,
+                               Vector<double>   &value) const;
+
+      };
+
+    
+
+    template <int dim>
+    double  BoundaryValues_w<dim>::value (const Point<dim>  &p,
+                              const unsigned int component) const
+      {
+
+       Assert (component < this->n_components,
+            ExcIndexRange (component, 0, this->n_components));
+
+       double x = p[0];
+       double y = p[1];
+       double t = this->get_time();
+
+       //static const double PI = 3.14159265358979323846;
+       // std::cout<<"Time in boundary conditions  ="<<t<<std::endl;
+      
+       if (component == 0)
+         return cos(y)-(1.0+exp(t))*sin(y);
+       if (component == 1)
+         return sin(x)-(1.0+exp(t))*cos(x);   
+       return 0;
+       
+      }
+
+
+     template <int dim>
+    void  BoundaryValues_w<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    {
+       for (unsigned int c=0; c<this->n_components; ++c)
+        values(c) = BoundaryValues_w<dim>::value (p, c);
+     }
+
+    template <int dim>
+   class BoundaryValues_v : public Function<dim>
+    {
+      public:
+      BoundaryValues_v () : Function<dim>(dim+1) {}
+
+      virtual double value (const Point<dim>   &p,
+                          const unsigned int  component = 0) const;
+
+      virtual void vector_value (const Point<dim> &p,
+                               Vector<double>   &value) const;
+
+      };
+
+    
+
+    template <int dim>
+    double  BoundaryValues_v<dim>::value (const Point<dim>  &p,
+                              const unsigned int component) const
+      {
+
+       Assert (component < this->n_components,
+            ExcIndexRange (component, 0, this->n_components));
+
+       double x = p[0];
+       double y = p[1];
+       double t = this->get_time();
+
+       //static const double PI = 3.14159265358979323846;
+       // std::cout<<"Time in boundary conditions  ="<<t<<std::endl;
+      
+       if (component == 0)
+         return cos(y)+(1.0+exp(t))*sin(y);
+       if (component == 1)
+         return sin(x)+(1.0+exp(t))*cos(x);   
+       return 0;
+       
+      }
+
+
+     template <int dim>
+    void  BoundaryValues_v<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    {
+       for (unsigned int c=0; c<this->n_components; ++c)
+        values(c) = BoundaryValues_v<dim>::value (p, c);
+     }
+
+   
+
+  // We implement similar functions for the right hand side which for the
+  // current example is simply zero:
+
+     template <int dim>
+     class RightHandSide_w : public Function<dim>
+     {
+     public:
+       RightHandSide_w () : Function<dim>(dim+1) {}
+     virtual double value (const Point<dim>   &p,
+                        const unsigned int  component = 0) const;
+     virtual void vector_value (const Point<dim> &p,
+                             Vector<double>   &value) const;
+      
+     };
+  
+    template <int dim>
+    double  RightHandSide_w<dim>::value (const Point<dim>  &p, 
+				const unsigned int component) const
+    {
+      double x = p[0];
+      double y = p[1];
+      double nu   = 1.0;
+      double nu_m = 1.0;
+      double t = this->get_time();
+     //std::cout<<"Time = "<<viscosity<<std::endl;
+      //static const double PI = 3.14159265358979323846;
+     
+      if (component == 0)
+		return -exp(t)*sin(y)+cos(x+y)*(1.0+exp(t))+(nu+nu_m)/2.0*(cos(y)-(1.0+exp(t))*sin(y))
+                        +(sin(x)+(1.0+exp(t))*cos(x))*(-sin(y)-(1.0+exp(t))*cos(y))
+                        +(nu-nu_m)/2.0*(cos(y)+(1.0+exp(t))*sin(y));
+	if (component == 1)
+		return -exp(t)*cos(x)+cos(x+y)*(1.0+exp(t))+(nu+nu_m)/2.0*(sin(x)-(1.0+exp(t))*cos(x))
+                        +(cos(y)+(1.0+exp(t))*sin(y))*(cos(x)+(1.0+exp(t))*sin(x))
+                        +(nu-nu_m)/2.0*(sin(x)+(1.0+exp(t))*cos(x));
+	return 0;
+      }
+     
+
+    template <int dim>
+    void  RightHandSide_w<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    {
+       for (unsigned int c=0; c<this->n_components; ++c)
+            values(c) = RightHandSide_w<dim>::value (p, c);
+     }
+
+
+
+    template <int dim>
+     class RightHandSide_v : public Function<dim>
+     {
+     public:
+       RightHandSide_v () : Function<dim>(dim+1) {}
+     virtual double value (const Point<dim>   &p,
+                        const unsigned int  component = 0) const;
+     virtual void vector_value (const Point<dim> &p,
+                             Vector<double>   &value) const;
+      
+     };
+  
+    template <int dim>
+    double  RightHandSide_v<dim>::value (const Point<dim>  &p, 
+				const unsigned int component) const
+    {
+      double x = p[0];
+      double y = p[1];
+      double nu   = 1.0;
+      double nu_m = 1.0;
+      double t = this->get_time();
+        
+       if (component == 0)
+		return exp(t)*sin(y)+cos(x+y)*(1.0+exp(t))+(nu+nu_m)/2.0*(cos(y)+(1.0+exp(t))*sin(y))
+                       +(sin(x)-(1.0+exp(t))*cos(x))*(-sin(y)+(1.0+exp(t))*cos(y))
+                       +(nu-nu_m)/2.0*(cos(y)-(1.0+exp(t))*sin(y));
+	if (component == 1)
+		return exp(t)*cos(x)+cos(x+y)*(1.0+exp(t))+(nu+nu_m)/2.0*(sin(x)+(1.0+exp(t))*cos(x))
+                       +(cos(x)-(1.0+exp(t))*sin(x))*(cos(y)-(1.0+exp(t))*sin(y))
+                       +(nu-nu_m)/2.0*(sin(x)-(1.0+exp(t))*cos(x));
+	return 0; 
+      }
+      
+      
+    template <int dim>
+    void  RightHandSide_v<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    {
+       for (unsigned int c=0; c<this->n_components; ++c)
+            values(c) = RightHandSide_v<dim>::value (p, c);
+     }
+
+
+    template <int dim>
+    class ExactSolution_w : public Function<dim>
+    {
+      public:
+        ExactSolution_w () : Function<dim>(dim+1) {}
+        virtual void vector_value (const Point<dim> &p, Vector<double>   &value) const;
+        virtual void vector_gradient (const Point<dim>   &p, std::vector< Tensor < 1, dim > > & gradients) const;
+     };
+
+    template <int dim>
+    void ExactSolution_w<dim>::vector_gradient (const Point<dim>   &p, std::vector< Tensor < 1, dim > > & gradients) const
+     {  
+        double x = p[0];
+        double y = p[1];
+        double t = this->get_time();
+        
+        gradients[0][0] = 0;
+        gradients[0][1] = -sin(y)-(1+exp(t))*cos(y);
+        gradients[1][0] =  cos(x)+(1+exp(t))*sin(x);
+        gradients[1][1] = 0;
+
+        
+     }
+
+    template <int dim>
+    void ExactSolution_w<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    { 
+      Assert (values.size() == dim+1, ExcDimensionMismatch (values.size(), dim+1));
+      double x = p[0];
+      double y = p[1];
+      double t = this->get_time();
+     //static const double PI = 3.14159265358979323846;
+     //std::cout<<"Time = "<<t<<std::endl;
+      values(0) = cos(y)-(1.0+exp(t))*sin(y);
+      values(1) = sin(x)-(1.0+exp(t))*cos(x);
+
+      values(2) = sin(x+y)*(1.0+exp(t));
+   
+      
+     }
+
+    template <int dim>
+    class ExactSolution_v : public Function<dim>
+    {
+      public:
+        ExactSolution_v () : Function<dim>(dim+1) {}
+        virtual void vector_value (const Point<dim> &p, Vector<double>   &value) const;
+        virtual void vector_gradient (const Point<dim>   &p, std::vector< Tensor < 1, dim > > & gradients) const;
+     };
+
+    template <int dim>
+    void ExactSolution_v<dim>::vector_gradient (const Point<dim>   &p, std::vector< Tensor < 1, dim > > & gradients) const
+     {  
+        double x = p[0];
+        double y = p[1];
+       double t = this->get_time();
+        
+        gradients[0][0] = 0;
+        gradients[0][1] = -sin(y)+(1+exp(t))*cos(y);
+        gradients[1][0] =  cos(x)-(1+exp(t))*sin(x);
+        gradients[1][1] = 0;
+
+        
+     }
+
+    template <int dim>
+    void ExactSolution_v<dim>::vector_value (const Point<dim> &p, Vector<double>   &values) const
+    { 
+      Assert (values.size() == dim+1, ExcDimensionMismatch (values.size(), dim+1));
+      double x = p[0];
+      double y = p[1];
+      double t = this->get_time();
+     //static const double PI = 3.14159265358979323846;
+     //std::cout<<"Time = "<<t<<std::endl;
+      values(0) = cos(y)+(1.0+exp(t))*sin(y);
+      values(1) = sin(x)+(1.0+exp(t))*cos(x);
+
+      values(2) = sin(x+y)*(1.0+exp(t));
+     }
+  }
+
+
+  template <int dim>
+  class NavierStokesProblem
+  {
+    public:
+    NavierStokesProblem (const unsigned int degree);
+    void run ();
+    
+
+    private:
+    void setup_dofs ();
+    void assemble_system (const bool solve_v);
+  
+    void solve (const bool solve_v);
+    void output_results (const unsigned int refinement_cycle) const;
+    void refine_mesh ();
+    double Error_v ();
+    double Error_w ();
+    
+    
+    double Elsasser_r_Error ();
+    const unsigned int   degree;
+    
+    Triangulation<dim>   triangulation;
+    FESystem<dim>        fe;
+    DoFHandler<dim>      dof_handler;
+
+    ConstraintMatrix     constraints_v, constraints_w;
+
+    BlockSparsityPattern      sparsity_pattern;
+    BlockSparseMatrix<double> system_matrix;
+    
+
+    BlockVector<double> old_timestep_solution_v, Interpolate_true_solution_v;
+    BlockVector<double> solution, old_timestep_solution_w, Interpolate_true_solution_w;
+
+    BlockVector<double> old_old_timestep_solution_v, old_old_timestep_solution_w;
+    
+    BlockVector<double> present_solution_v, present_solution_w;
+
+    BlockVector<double> system_rhs, exact_v, exact_w;
+    
+    ConvergenceTable convergence_table;
+  
+    EquationData::RightHandSide_v<dim> right_hand_side_v;
+    EquationData::RightHandSide_w<dim> right_hand_side_w;
+    EquationData::BoundaryValues_v<dim>             boundary_values_v;
+    EquationData::BoundaryValues_w<dim>             boundary_values_w;
+    EquationData::ExactSolution_v<dim>  exact_solution_v;    
+    EquationData::ExactSolution_w<dim>  exact_solution_w;
+
+    double time, time_step;
+    unsigned int timestep_number;
+    double viscosity = 1.0;
+    double mangetic_viscosity = 1.0;
+        
+   
+    
+
+    std_cxx11::shared_ptr<typename InnerPreconditioner<dim>::type> A_preconditioner;
+   };
+
+    template <class Matrix, class Preconditioner>
+  class InverseMatrix : public Subscriptor
+  {
+   public:
+    InverseMatrix (const Matrix         &m,
+                   const Preconditioner &preconditioner);
+
+    void vmult (Vector<double>       &dst,
+                const Vector<double> &src) const;
+
+   private:
+    const SmartPointer<const Matrix> matrix;
+    const SmartPointer<const Preconditioner> preconditioner;
+  };
+
+
+  template <class Matrix, class Preconditioner>
+  InverseMatrix<Matrix,Preconditioner>::InverseMatrix (const Matrix &m,
+                                                       const Preconditioner &preconditioner)
+    :
+    matrix (&m),
+    preconditioner (&preconditioner)
+  {}
+
+
+    template <class Matrix, class Preconditioner>
+  void InverseMatrix<Matrix,Preconditioner>::vmult (Vector<double>       &dst,
+                                                    const Vector<double> &src) const
+  { 
+    SolverControl solver_control (src.size(), 1e-6*src.l2_norm());
+    SolverCG<>    cg (solver_control);
+
+    dst = 0;
+
+    cg.solve (*matrix, dst, src, *preconditioner);
+  }
+
+
+  
+  template <class Preconditioner>
+  class SchurComplement : public Subscriptor
+  {
+  public:
+    SchurComplement (const BlockSparseMatrix<double> &system_matrix,
+                     const InverseMatrix<SparseMatrix<double>, Preconditioner> &A_inverse);
+
+    void vmult (Vector<double>       &dst,
+                const Vector<double> &src) const;
+
+  private:
+    const SmartPointer<const BlockSparseMatrix<double> > system_matrix;
+    const SmartPointer<const InverseMatrix<SparseMatrix<double>, Preconditioner> > A_inverse;
+
+    mutable Vector<double> tmp1, tmp2;
+  };
+
+
+
+  template <class Preconditioner>
+  SchurComplement<Preconditioner>::
+  SchurComplement (const BlockSparseMatrix<double> &system_matrix,
+                   const InverseMatrix<SparseMatrix<double>,Preconditioner> &A_inverse)
+    :
+    system_matrix (&system_matrix),
+    A_inverse (&A_inverse),
+    tmp1 (system_matrix.block(0,0).m()),
+    tmp2 (system_matrix.block(0,0).m())
+  {}
+
+
+  template <class Preconditioner>
+  void SchurComplement<Preconditioner>::vmult (Vector<double>       &dst,
+                                               const Vector<double> &src) const
+  { //std::cout<<"I am s"<<std::endl;
+    system_matrix->block(0,1).vmult (tmp1, src);
+    A_inverse->vmult (tmp2, tmp1);
+    system_matrix->block(1,0).vmult (dst, tmp2);
+  }
+
+
+  // @sect3{StokesProblem class implementation}
+
+  // @sect4{StokesProblem::StokesProblem}
+
+  // The constructor of this class looks very similar to the one of
+  // step-20. The constructor initializes the variables for the polynomial
+  // degree, triangulation, finite element system and the dof handler. The
+  // underlying polynomial functions are of order <code>degree+1</code> for
+  // the vector-valued velocity components and of order <code>degree</code>
+  // for the pressure.  This gives the LBB-stable element pair
+  // $Q_{degree+1}^d\times Q_{degree}$, often referred to as the Taylor-Hood
+  // element.
+  //
+  // Note that we initialize the triangulation with a MeshSmoothing argument,
+  // which ensures that the refinement of cells is done in a way that the
+  // approximation of the PDE solution remains well-behaved (problems arise if
+  // grids are too unstructured), see the documentation of
+  // <code>Triangulation::MeshSmoothing</code> for details.
+  template <int dim>
+  NavierStokesProblem<dim>::NavierStokesProblem (const unsigned int degree)
+    :
+    degree (degree),
+    triangulation (Triangulation<dim>::maximum_smoothing),
+    fe (FE_Q<dim>(degree+1), dim,
+        FE_Q<dim>(degree), 1),
+    dof_handler (triangulation),
+    time_step (1/2.0),
+    timestep_number(2)
+  {}
+
+
+  // @sect4{StokesProblem::setup_dofs}
+
+  // Given a mesh, this function associates the degrees of freedom with it and
+  // creates the corresponding matrices and vectors. At the beginning it also
+  // releases the pointer to the preconditioner object (if the shared pointer
+  // pointed at anything at all at this point) since it will definitely not be
+  // needed any more after this point and will have to be re-computed after
+  // assembling the matrix, and unties the sparse matrix from its sparsity
+  // pattern object.
+  //
+  // We then proceed with distributing degrees of freedom and renumbering
+  // them: In order to make the ILU preconditioner (in 3D) work efficiently,
+  // it is important to enumerate the degrees of freedom in such a way that it
+  // reduces the bandwidth of the matrix, or maybe more importantly: in such a
+  // way that the ILU is as close as possible to a real LU decomposition. On
+  // the other hand, we need to preserve the block structure of velocity and
+  // pressure already seen in in step-20 and step-21. This is done in two
+  // steps: First, all dofs are renumbered to improve the ILU and then we
+  // renumber once again by components. Since
+  // <code>DoFRenumbering::component_wise</code> does not touch the
+  // renumbering within the individual blocks, the basic renumbering from the
+  // first step remains. As for how the renumber degrees of freedom to improve
+  // the ILU: deal.II has a number of algorithms that attempt to find
+  // orderings to improve ILUs, or reduce the bandwidth of matrices, or
+  // optimize some other aspect. The DoFRenumbering namespace shows a
+  // comparison of the results we obtain with several of these algorithms
+  // based on the testcase discussed here in this tutorial program. Here, we
+  // will use the traditional Cuthill-McKee algorithm already used in some of
+  // the previous tutorial programs.  In the <a href="#improved-ilu">section
+  // on improved ILU</a> we're going to discuss this issue in more detail.
+
+  // There is one more change compared to previous tutorial programs: There is
+  // no reason in sorting the <code>dim</code> velocity components
+  // individually. In fact, rather than first enumerating all $x$-velocities,
+  // then all $y$-velocities, etc, we would like to keep all velocities at the
+  // same location together and only separate between velocities (all
+  // components) and pressures. By default, this is not what the
+  // DoFRenumbering::component_wise function does: it treats each vector
+  // component separately; what we have to do is group several components into
+  // "blocks" and pass this block structure to that function. Consequently, we
+  // allocate a vector <code>block_component</code> with as many elements as
+  // there are components and describe all velocity components to correspond
+  // to block 0, while the pressure component will form block 1:
+  template <int dim>
+  void NavierStokesProblem<dim>::setup_dofs ()
+  {  
+    
+    system_matrix.clear ();
+
+    dof_handler.distribute_dofs (fe);
+    
+
+    std::vector<unsigned int> block_component (dim+1,0);
+    block_component[dim] = 1;
+    DoFRenumbering::component_wise (dof_handler, block_component);
+    
+      
+    
+    //constraints_v.clear ();
+    //constraints_w.clear ();
+    
+    // constraints_v.close ();
+    // constraints_w.close ();
+      
+    // In analogy to step-20, we count the dofs in the individual components.
+    // We could do this in the same way as there, but we want to operate on
+    // the block structure we used already for the renumbering: The function
+    // <code>DoFTools::count_dofs_per_block</code> does the same as
+    // <code>DoFTools::count_dofs_per_component</code>, but now grouped as
+    // velocity and pressure block via <code>block_component</code>.
+
+    std::vector<types::global_dof_index> dofs_per_block (2);
+    DoFTools::count_dofs_per_block (dof_handler, dofs_per_block, block_component);
+
+    const unsigned int n_v = dofs_per_block[0],
+                       n_p = dofs_per_block[1];
+    
+    //constraints.add_line(n_u);
+    /* std::cout << "   Number of active cells: "
+              << triangulation.n_active_cells()
+              << std::endl
+              << "   Number of degrees of freedom: "
+              << dof_handler.n_dofs()
+              << " (" << n_u << '+' << n_p << ')'
+              << std::endl;*/
+     
+    // The next task is to allocate a sparsity pattern for the system matrix
+    // we will create. We could do this in the same way as in step-20,
+    // i.e. directly build an object of type SparsityPattern through
+    // DoFTools::make_sparsity_pattern. However, there is a major reason not
+    // to do so: In 3D, the function DoFTools::max_couplings_between_dofs
+    // yields a conservative but rather large number for the coupling between
+    // the individual dofs, so that the memory initially provided for the
+    // creation of the sparsity pattern of the matrix is far too much -- so
+    // much actually that the initial sparsity pattern won't even fit into the
+    // physical memory of most systems already for moderately-sized 3D
+    // problems, see also the discussion in step-18.  Instead, we first build
+    // a temporary object that uses a different data structure that doesn't
+    // require allocating more memory than necessary but isn't suitable for
+    // use as a basis of SparseMatrix or BlockSparseMatrix objects; in a
+    // second step we then copy this object into an object of
+    // BlockSparsityPattern. This is entirely analogous to what we already did
+    // in step-11 and step-18.
+    //
+    // There is one snag again here, though: it turns out that using the
+    // CompressedSparsityPattern (or the block version
+    // BlockCompressedSparsityPattern we would use here) has a bottleneck that
+    // makes the algorithm to build the sparsity pattern be quadratic in the
+    // number of degrees of freedom. This doesn't become noticeable until we
+    // get well into the range of several 100,000 degrees of freedom, but
+    // eventually dominates the setup of the linear system when we get to more
+    // than a million degrees of freedom. This is due to the data structures
+    // used in the CompressedSparsityPattern class, nothing that can easily be
+    // changed. Fortunately, there is an easy solution: the
+    // CompressedSimpleSparsityPattern class (and its block variant
+    // BlockCompressedSimpleSparsityPattern) has exactly the same interface,
+    // uses a different %internal data structure and is linear in the number
+    // of degrees of freedom and therefore much more efficient for large
+    // problems. As another alternative, we could also have chosen the class
+    // BlockCompressedSetSparsityPattern that uses yet another strategy for
+    // %internal memory management. Though, that class turns out to be more
+    // memory-demanding than BlockCompressedSimpleSparsityPattern for this
+    // example.
+    //
+    // Consequently, this is the class that we will use for our intermediate
+    // sparsity representation. All this is done inside a new scope, which
+    // means that the memory of <code>csp</code> will be released once the
+    // information has been copied to <code>sparsity_pattern</code>.
+    {
+      BlockDynamicSparsityPattern csp (2,2);
+
+      csp.block(0,0).reinit (n_v, n_v);
+      csp.block(1,0).reinit (n_p, n_v);
+      csp.block(0,1).reinit (n_v, n_p);
+      csp.block(1,1).reinit (n_p, n_p);
+
+      csp.collect_sizes();
+
+      DoFTools::make_sparsity_pattern (dof_handler, csp, constraints_v, false);
+      DoFTools::make_sparsity_pattern (dof_handler, csp, constraints_w, false);
+      sparsity_pattern.copy_from (csp);
+    }
+
+    // Finally, the system matrix, solution and right hand side are created
+    // from the block structure as in step-20:
+    //system_matrix_v.reinit (sparsity_pattern);
+    system_matrix.reinit (sparsity_pattern);
+
+    solution.reinit (2);
+
+    solution.block(0).reinit (n_v);
+    solution.block(1).reinit (n_p);
+    solution.collect_sizes ();
+
+   
+
+    old_timestep_solution_v.reinit (2);
+    old_timestep_solution_v.block(0).reinit (n_v);
+    old_timestep_solution_v.block(1).reinit (n_p);
+    old_timestep_solution_v.collect_sizes ();    
+    
+    old_timestep_solution_w.reinit (2);
+    old_timestep_solution_w.block(0).reinit (n_v);
+    old_timestep_solution_w.block(1).reinit (n_p);
+    old_timestep_solution_w.collect_sizes ();
+
+
+    old_old_timestep_solution_v.reinit (2);
+    old_old_timestep_solution_v.block(0).reinit (n_v);
+    old_old_timestep_solution_v.block(1).reinit (n_p);
+    old_old_timestep_solution_v.collect_sizes ();    
+    
+    old_old_timestep_solution_w.reinit (2);
+    old_old_timestep_solution_w.block(0).reinit (n_v);
+    old_old_timestep_solution_w.block(1).reinit (n_p);
+    old_old_timestep_solution_w.collect_sizes ();
+
+
+
+    present_solution_v.reinit (2);
+    present_solution_v.block(0).reinit (n_v);
+    present_solution_v.block(1).reinit (n_p);
+    present_solution_v.collect_sizes ();    
+    
+    present_solution_w.reinit (2);
+    present_solution_w.block(0).reinit (n_v);
+    present_solution_w.block(1).reinit (n_p);
+    present_solution_w.collect_sizes ();
+    
+    
+    Interpolate_true_solution_w.reinit (2);
+    Interpolate_true_solution_w.block(0).reinit (n_v);
+    Interpolate_true_solution_w.block(1).reinit (n_p);
+    Interpolate_true_solution_w.collect_sizes (); 
+
+    Interpolate_true_solution_v.reinit (2);
+    Interpolate_true_solution_v.block(0).reinit (n_v);
+    Interpolate_true_solution_v.block(1).reinit (n_p);
+    Interpolate_true_solution_v.collect_sizes (); 
+
+    
+    system_rhs.reinit (2);
+    system_rhs.block(0).reinit (n_v);
+    system_rhs.block(1).reinit (n_p);
+    system_rhs.collect_sizes ();
+  }
+
+
+  // @sect4{StokesProblem::assemble_system}
+
+  // The assembly process follows the discussion in step-20 and in the
+  // introduction. We use the well-known abbreviations for the data structures
+  // that hold the local matrix, right hand side, and global numbering of the
+  // degrees of freedom for the present cell.
+
+  template <int dim>
+  void NavierStokesProblem<dim>::assemble_system (const bool solve_v)
+  { 
+    
+    system_matrix= 0;
+
+    
+    system_rhs= 0;
+         
+    QGauss<dim>   quadrature_formula(degree+2);
+
+    FEValues<dim> fe_values (fe, quadrature_formula,
+                             update_values    |
+                             update_quadrature_points  |
+                             update_JxW_values |
+                             update_gradients);
+
+    const unsigned int   dofs_per_cell   = fe.dofs_per_cell;
+
+    const unsigned int   n_q_points      = quadrature_formula.size();
+
+    
+    FullMatrix<double>   local_matrix (dofs_per_cell, dofs_per_cell);
+
+    
+    Vector<double>       local_rhs (dofs_per_cell);
+
+    std::vector<types::global_dof_index> local_dof_indices (dofs_per_cell);
+
+    
+    std::vector<Vector<double> >      rhs_values_v (n_q_points, Vector<double>(dim+1));
+    std::vector<Vector<double> >      rhs_values_w (n_q_points, Vector<double>(dim+1));
+    std::vector<Vector<double> >      exact_values_v      (n_q_points, Vector<double>(dim+1));
+    std::vector<Vector<double> >      exact_values_w      (n_q_points, Vector<double>(dim+1));
+   
+    // std::vector<Tensor<1,dim> >       exact_gradient_values_v    (n_q_points);
+    // std::vector<Tensor<2,dim> >       exact_gradient_values_w    (n_q_points);
+    // Next, we need two objects that work as extractors for the FEValues
+    // object. Their use is explained in detail in the report on @ref
+    // vector_valued :
+    
+    const FEValuesExtractors::Vector elsasser (0);
+    const FEValuesExtractors::Scalar elsasser_p (dim);
+
+    
+
+    if(solve_v){
+
+          constraints_v.clear ();
+          VectorTools::interpolate_boundary_values (dof_handler,
+                                                0,
+                                                boundary_values_v,
+                                                constraints_v,
+                                                fe.component_mask(elsasser));
+          constraints_v.close();
+     }
+
+    else {
+
+          constraints_w.clear ();
+          VectorTools::interpolate_boundary_values (dof_handler,
+                                                0,
+                                                boundary_values_w,
+                                                constraints_w,
+                                                fe.component_mask(elsasser));
+          constraints_w.close();
+      }
+    
+       
+    
+    std::vector<Tensor<2,dim> >             grad_phi (dofs_per_cell);
+    std::vector<double>                      div_phi (dofs_per_cell);
+    std::vector<double>                        phi_p (dofs_per_cell);
+    std::vector<Tensor<1,dim> >                  phi (dofs_per_cell);
+
+    std::vector<Tensor<1,dim> > old_time_v_values (n_q_points);
+    std::vector<Tensor<1,dim> > old_time_w_values (n_q_points);
+    
+    std::vector<Tensor<1,dim> > old_old_time_v_values (n_q_points);
+    std::vector<Tensor<1,dim> > old_old_time_w_values (n_q_points);
+    
+    std::vector<Tensor<2,dim> > old_v_gradients_values (n_q_points);
+    std::vector<Tensor<2,dim> > old_w_gradients_values (n_q_points);
+
+    std::vector<Tensor<2,dim> > old_old_v_gradients_values (n_q_points);
+    std::vector<Tensor<2,dim> > old_old_w_gradients_values (n_q_points);
+
+
+   // std::vector<Tensor<2,dim> > exact_w_gradients_values (n_q_points);
+    
+
+    
+    typename DoFHandler<dim>::active_cell_iterator
+    
+    cell = dof_handler.begin_active(),
+    endc = dof_handler.end();
+    
+    for (; cell!=endc; ++cell)
+      {
+       fe_values.reinit (cell);
+
+    
+       local_matrix = 0;
+
+      
+       local_rhs= 0;
+
+       fe_values[elsasser].get_function_values(old_timestep_solution_v, old_time_v_values);
+       fe_values[elsasser].get_function_values(old_timestep_solution_w, old_time_w_values);
+
+       
+       fe_values[elsasser].get_function_values(old_old_timestep_solution_v, old_old_time_v_values);
+       fe_values[elsasser].get_function_values(old_old_timestep_solution_w, old_old_time_w_values);
+
+       fe_values[elsasser].get_function_gradients(old_timestep_solution_w, old_w_gradients_values);
+       fe_values[elsasser].get_function_gradients(old_timestep_solution_v, old_v_gradients_values);
+
+       fe_values[elsasser].get_function_gradients(old_old_timestep_solution_w, old_old_w_gradients_values);
+       fe_values[elsasser].get_function_gradients(old_old_timestep_solution_v, old_old_v_gradients_values);
+
+       right_hand_side_v.vector_value_list(fe_values.get_quadrature_points(), rhs_values_v);
+       right_hand_side_w.vector_value_list(fe_values.get_quadrature_points(), rhs_values_w);
+     //  exact_solution_w.vector_gradient (fe_values.get_quadrature_points(), exact_w_gradients_values);
+
+        for (unsigned int q=0; q<n_q_points; ++q)
+          {
+            for (unsigned int k=0; k<dofs_per_cell; ++k)
+              {
+                grad_phi[k]    = fe_values[elsasser].gradient (k, q);
+                div_phi[k]     = fe_values[elsasser].divergence (k, q);
+                phi_p[k]       = fe_values[elsasser_p].value (k, q);
+                phi[k]         = fe_values[elsasser].value (k, q);
+              }
+	
+		
+            for (unsigned int i=0; i<dofs_per_cell; ++i)
+              {
+                 
+        
+                 for (unsigned int j=0; j<dofs_per_cell; ++j)
+                  {
+                    if(solve_v)
+                         local_matrix(i,j) += (1.5 * phi[i]*phi[j]+time_step*(viscosity+mangetic_viscosity)/2.0
+                                          *scalar_product(grad_phi[i],grad_phi[j])
+                                          -time_step* div_phi[i] * phi_p[j]
+                                          +2.0 * time_step* grad_phi[j] * old_time_w_values[q]*phi[i]
+                                          -time_step* grad_phi[j] * old_old_time_w_values[q]*phi[i]
+                                          -time_step* phi_p[i]*div_phi[j])* fe_values.JxW(q);
+		    else 
+                         local_matrix(i,j) += (1.5 * phi[i]*phi[j]+time_step*(viscosity+mangetic_viscosity)/2.0
+                                           *scalar_product(grad_phi[i],grad_phi[j])
+                                           -time_step*div_phi[i] * phi_p[j]
+                                           +2.0 * time_step*grad_phi[j]* old_time_v_values[q]*phi[i]
+                                           -time_step*grad_phi[j]* old_old_time_v_values[q]*phi[i]
+                                           -time_step* phi_p[i]*div_phi[j])* fe_values.JxW(q);
+                          
+                          
+                                  
+                  }
+                
+               const unsigned int component_i = fe.system_to_component_index(i).first;
+
+		Tensor<2,dim> v_grad_exact;
+		Tensor<2,dim> w_grad_exact;
+		Point<dim> pos = fe_values.quadrature_point(q);
+		std::vector<Tensor<1,dim> > answer1(dim);
+		std::vector<Tensor<1,dim> > answer2(dim);
+		exact_solution_v.vector_gradient(pos, answer1);
+		exact_solution_w.vector_gradient(pos, answer2);
+
+		v_grad_exact[0]=answer1[0];
+		v_grad_exact[1]=answer1[1];
+		w_grad_exact[0]=answer2[0];
+		w_grad_exact[1]=answer2[1];
+// c++ classes, inheritance, base class
+
+               if(solve_v)
+                   local_rhs(i) += (time_step*fe_values.shape_value(i,q)* rhs_values_v[q](component_i)
+                   +2.0 * old_time_v_values[q]*phi[i] -0.5 * old_old_time_v_values[q]*phi[i]
+                   -time_step*(viscosity-mangetic_viscosity)
+                   *scalar_product(grad_phi[i], old_w_gradients_values[q])
+                   +time_step*(viscosity-mangetic_viscosity)/2.0
+                   *scalar_product(grad_phi[i], old_old_w_gradients_values[q]))*fe_values.JxW(q);
+               else
+                   local_rhs(i) += (time_step*fe_values.shape_value(i,q)* rhs_values_w[q](component_i)
+                   +2.0 * old_time_w_values[q]*phi[i] -0.5 * old_old_time_w_values[q]*phi[i]
+                   -time_step*(viscosity-mangetic_viscosity)
+                   *scalar_product(grad_phi[i], old_v_gradients_values[q])
+                   +time_step*(viscosity-mangetic_viscosity)/2.0
+                   *scalar_product(grad_phi[i], old_old_v_gradients_values[q]))*fe_values.JxW(q);
+             }
+          }
+        
+	
+        cell->get_dof_indices (local_dof_indices);
+        if(solve_v)
+         constraints_v.distribute_local_to_global (local_matrix, local_rhs,
+                                                local_dof_indices,
+                                                system_matrix, system_rhs);
+        else
+         constraints_w.distribute_local_to_global (local_matrix, local_rhs,
+                                                local_dof_indices,
+                                                system_matrix, system_rhs);
+      }
+    
+  }
+
+
+
+  
+  template <int dim>
+  void NavierStokesProblem<dim>::solve (const bool solve_v)
+  { 
+     solution = 0;
+     SparseDirectUMFPACK solver;
+     solver.initialize (system_matrix);
+     solver.vmult(solution,system_rhs);
+     
+     if(solve_v)
+        constraints_v.distribute (solution);
+     else
+	constraints_w.distribute (solution);
+        
+         
+     
+  }
+
+
+  
+  template <int dim>
+  void  NavierStokesProblem<dim>::output_results (const unsigned int refinement_cycle)  const
+  {
+    std::vector<std::string> solution_names (dim, "velocity");
+    solution_names.push_back ("pressure");
+
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+    data_component_interpretation
+    (dim, DataComponentInterpretation::component_is_part_of_vector);
+    data_component_interpretation
+    .push_back (DataComponentInterpretation::component_is_scalar);
+
+    DataOut<dim> data_out;
+    data_out.attach_dof_handler (dof_handler);
+    //data_out.add_data_vector (solution_v, solution_names,
+      //                        DataOut<dim>::type_dof_data,
+        //                      data_component_interpretation);
+    data_out.build_patches ();
+
+    std::ostringstream filename;
+    filename << "solution-"
+             << Utilities::int_to_string (refinement_cycle, 2)
+             << ".vtk";
+
+    std::ofstream output (filename.str().c_str());
+    data_out.write_vtk (output);
+  }
+
+
+  // @sect4{StokesProblem::refine_mesh}
+
+  // This is the last interesting function of the <code>StokesProblem</code>
+  // class.  As indicated by its name, it takes the solution to the problem
+  // and refines the mesh where this is needed. The procedure is the same as
+  // in the respective step in step-6, with the exception that we base the
+  // refinement only on the change in pressure, i.e., we call the Kelly error
+  // estimator with a mask object of type ComponentMask that selects the
+  // single scalar component for the pressure that we are interested in (we
+  // get such a mask from the finite element class by specifying the component
+  // we want). Additionally, we do not coarsen the grid again:
+  
+   template <int dim>
+   double NavierStokesProblem<dim>::Elsasser_r_Error ()
+   { 
+    double true_pres_mean_value = 0;
+    double L2_Pressure_Error = 0;
+    double finite_pres_mean_value = 0.0;
+    
+    const ComponentSelectFunction<dim>  elsasser_r_mask (dim, dim+1);
+
+    Vector<double> difference_per_cell_3 (triangulation.n_active_cells());
+
+    finite_pres_mean_value = VectorTools::compute_mean_value (dof_handler,
+                                              QGauss<2>(4),
+                                              present_solution_w,
+                                              dim);
+
+    VectorTools::interpolate (dof_handler, exact_solution_w, Interpolate_true_solution_w);
+    true_pres_mean_value = VectorTools::compute_mean_value (dof_handler,
+                                              QGauss<2>(4),
+                                              Interpolate_true_solution_w,
+                                              dim);
+    present_solution_w.block(1).add(-finite_pres_mean_value+true_pres_mean_value);
+    
+    
+   // std::cout<<"TPM ="<<true_pres_mean_value<<"  FPM ="<<finite_pres_mean_value<<std::endl;
+
+    VectorTools::integrate_difference (dof_handler, 
+                                     present_solution_w,
+                                     exact_solution_w,
+                                     difference_per_cell_3,
+                                     QGauss<dim>(4),
+                                     VectorTools::L2_norm, &elsasser_r_mask);
+
+  
+     L2_Pressure_Error = difference_per_cell_3.l2_norm();
+     
+      
+      return L2_Pressure_Error*L2_Pressure_Error;
+     }
+    
+   template <int dim>
+   double NavierStokesProblem<dim>::Error_v ()
+   { 
+    
+    double L2error = 0;
+    double H1Error = 0;
+    const ComponentSelectFunction<dim> elsasser_v_mask(std::make_pair(0, dim), dim+1);
+    
+    //exact_solution.set_time(time);
+    //std::cout<<"Time in error function="<<get_time()<<std::endl;
+    //const unsigned int n_active_cells=triangulation.n_active_cells();
+    //const unsigned int n_dofs=dof_handler.n_dofs();
+    
+   
+    Vector<double> difference_per_cell_3 (triangulation.n_active_cells());
+    Vector<double> difference_per_cell_4 (triangulation.n_active_cells());
+     
+
+    VectorTools::integrate_difference (dof_handler, 
+                                     present_solution_v,
+                                     exact_solution_v,
+                                     difference_per_cell_3,
+                                     QGauss<dim>(4),
+                                     VectorTools::L2_norm, & elsasser_v_mask);
+
+    /* VectorTools::integrate_difference (dof_handler, 
+                                     solution,
+                                     exact_solution,
+                                     difference_per_cell_2,
+                                     QGauss<dim>(4),
+                                     VectorTools::L2_norm, &velocity_mask);*/
+
+     VectorTools::integrate_difference (dof_handler, 
+                                     present_solution_v,
+                                     exact_solution_v,
+                                     difference_per_cell_4,
+                                     QGauss<dim>(4),
+                                     VectorTools::H1_seminorm, & elsasser_v_mask); 
+ 
+      L2error = difference_per_cell_3.l2_norm();
+      H1Error = difference_per_cell_4.l2_norm();
+     
+
+      
+      return L2error*L2error+H1Error*H1Error;
+     }
+
+
+  
+
+   template <int dim>
+   double NavierStokesProblem<dim>::Error_w ()
+   { 
+    
+    double L2error = 0;
+    double H1Error = 0;
+    const ComponentSelectFunction<dim> elsasser_w_mask(std::make_pair(0, dim), dim+1);
+    
+    //exact_solution.set_time(time);
+    //std::cout<<"Time in error function="<<get_time()<<std::endl;
+    //const unsigned int n_active_cells=triangulation.n_active_cells();
+    //const unsigned int n_dofs=dof_handler.n_dofs();
+    
+     
+    Vector<double> difference_per_cell_3 (triangulation.n_active_cells());
+    Vector<double> difference_per_cell_4 (triangulation.n_active_cells());
+     
+
+    VectorTools::integrate_difference (dof_handler, 
+                                     present_solution_w,
+                                     exact_solution_w,
+                                     difference_per_cell_3,
+                                     QGauss<dim>(4),
+                                     VectorTools::L2_norm, &elsasser_w_mask);
+
+    /* VectorTools::integrate_difference (dof_handler, 
+                                     solution,
+                                     exact_solution,
+                                     difference_per_cell_2,
+                                     QGauss<dim>(4),
+                                     VectorTools::L2_norm, &velocity_mask);*/
+
+     VectorTools::integrate_difference (dof_handler, 
+                                     present_solution_w,
+                                     exact_solution_w,
+                                     difference_per_cell_4,
+                                     QGauss<dim>(4),
+                                     VectorTools::H1_seminorm, &elsasser_w_mask);  
+ 
+      L2error = difference_per_cell_3.l2_norm();
+      H1Error = difference_per_cell_4.l2_norm();
+     
+     //std::cout << "L2Error= "<<L2error <<" H1 error = "<<H1Error<< std::endl;
+
+      
+      return L2error*L2error+H1Error*H1Error;
+     }
+
+
+  // @sect4{StokesProblem::run}
+
+  // The last step in the Stokes class is, as usual, the function that
+  // generates the initial grid and calls the other functions in the
+  // respective order.
+  //
+  // We start off with a rectangle of size $4 \times 1$ (in 2d) or $4 \times 1
+  // \times 1$ (in 3d), placed in $R^2/R^3$ as $(-2,2)\times(-1,0)$ or
+  // $(-2,2)\times(0,1)\times(-1,0)$, respectively. It is natural to start
+  // with equal mesh size in each direction, so we subdivide the initial
+  // rectangle four times in the first coordinate direction. To limit the
+  // scope of the variables involved in the creation of the mesh to the range
+  // where we actually need them, we put the entire block between a pair of
+  // braces:
+  template <int dim>
+  void NavierStokesProblem<dim>::run ()
+  {
+      double H1_elsasser_v_error = 0.0;
+      double H1_elsasser_w_error = 0.0;
+
+      double L2H1_elsasser_v_error = 0.0;
+      double L2H1_elsasser_w_error = 0.0;
+
+      
+	
+      double L2_elsasser_r_error = 0.0;  
+      double L2L2_elsasser_r_error = 0.0;    
+      
+
+      bool solve_v;
+
+      
+
+      GridGenerator::hyper_cube (triangulation, 0, 1);
+     
+
+    // We then apply an initial refinement before solving for the first
+    // time. In 3D, there are going to be more degrees of freedom, so we
+    // refine less there:
+      triangulation.refine_global (6);
+
+    
+        time = 0.0;
+	
+        exact_solution_v.set_time(time);
+        exact_solution_w.set_time(time);
+
+        
+        old_old_timestep_solution_v = 0;
+        old_old_timestep_solution_w = 0;
+        
+        old_timestep_solution_v = 0;
+        old_timestep_solution_w = 0;
+
+   
+        setup_dofs ();
+
+        VectorTools::interpolate(dof_handler, exact_solution_v, present_solution_v);
+        VectorTools::interpolate(dof_handler, exact_solution_w, present_solution_w);
+
+        old_old_timestep_solution_v = present_solution_v;
+	old_old_timestep_solution_w = present_solution_w;
+
+        std::cout<<"Interpolation Error"<<std::endl;
+        std::cout<<"VError="<<Error_v ()<<std::endl;
+        std::cout<<"WError="<<Error_w ()<<std::endl;
+	std::cout<<"Interpolation Error"<<std::endl;
+
+        
+
+        time = time_step*1;
+
+        exact_solution_v.set_time(time);
+        exact_solution_w.set_time(time);
+
+
+        VectorTools::interpolate(dof_handler, exact_solution_v, present_solution_v);
+        VectorTools::interpolate(dof_handler, exact_solution_w, present_solution_w);
+
+
+        std::cout<<"Interpolation Error"<<std::endl;
+        std::cout<<"VError="<<Error_v ()<<std::endl;
+        std::cout<<"WError="<<Error_w ()<<std::endl;
+	std::cout<<"Interpolation Error"<<std::endl;
+
+
+        for (unsigned int n=2; n<=timestep_number; ++n){
+    
+	old_timestep_solution_v = present_solution_v;
+	old_timestep_solution_w = present_solution_w;
+
+        
+        time = time_step*n;
+        //std::cout<<"Current Time="<<time<<std::endl;
+        right_hand_side_v.set_time(time);
+        right_hand_side_w.set_time(time);
+
+        boundary_values_v.set_time(time);
+        boundary_values_w.set_time(time);
+
+        exact_solution_v.set_time(time);
+        exact_solution_w.set_time(time);
+
+       //mak std::cout<<exact_solution_v.vector_value[0]<<std::endl;
+
+        solve_v = true; 
+        assemble_system (solve_v);
+        
+        
+	solve (solve_v);       
+	present_solution_v = solution;
+        
+        
+        solve_v = false;
+
+        assemble_system (solve_v);
+        
+        solve (solve_v);
+        
+        present_solution_w = solution;
+
+
+	std::cout<<"VError="<<Error_v ()<<std::endl;
+        std::cout<<"WError="<<Error_w ()<<std::endl;
+        
+        H1_elsasser_v_error = H1_elsasser_v_error + Error_v ();
+        H1_elsasser_w_error = H1_elsasser_w_error + Error_w ();
+
+	L2_elsasser_r_error = L2_elsasser_r_error + Elsasser_r_Error ();
+
+
+        old_old_timestep_solution_v = old_timestep_solution_v;
+        old_old_timestep_solution_w = old_timestep_solution_w;
+        }
+        output_results (6);
+
+        std::cout << std::endl;
+        L2H1_elsasser_v_error = sqrt(time_step* H1_elsasser_v_error);
+	L2H1_elsasser_w_error = sqrt(time_step* H1_elsasser_w_error);
+      //  L2L2_elsasser_q_error[refinement_cycle+1] = sqrt(time_step* L2_elsasser_q_error);
+	L2L2_elsasser_r_error = sqrt(time_step* L2_elsasser_r_error);
+     
+     std:: cout<< "Timesteps= "<< timestep_number <<"    L2H1Error_v= "
+               <<L2H1_elsasser_v_error<<std::endl;
+     std:: cout<< "Timesteps= "<< timestep_number <<"    L2H1Error_w= "
+               <<L2H1_elsasser_w_error<<std::endl;
+
+     
+     std:: cout<< "Timesteps= "<< timestep_number 
+               <<"    L2L2_Pressure_r_Error= "<<L2L2_elsasser_r_error<<std::endl;
+     
+    
+     
+     
+   
+  }
+}
+
+
+int main ()
+{
+  try
+    {
+      using namespace dealii;
+      using namespace MHD;
+
+      deallog.depth_console (0);
+
+      NavierStokesProblem<2> flow_problem(1);
+      flow_problem.run ();
+    }
+  catch (std::exception &exc)
+    {
+      std::cerr << std::endl << std::endl
+                << "----------------------------------------------------"
+                << std::endl;
+      std::cerr << "Exception on processing: " << std::endl
+                << exc.what() << std::endl
+                << "Aborting!" << std::endl
+                << "----------------------------------------------------"
+                << std::endl;
+
+      return 1;
+    }
+  catch (...)
+    {
+      std::cerr << std::endl << std::endl
+                << "----------------------------------------------------"
+                << std::endl;
+      std::cerr << "Unknown exception!" << std::endl
+                << "Aborting!" << std::endl
+                << "----------------------------------------------------"
+                << std::endl;
+      return 1;
+    }
+
+  return 0;
+}
