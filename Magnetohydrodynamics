@@ -11,8 +11,8 @@
  * small spatial step size h=1/64 and end time T=1. We consider a unit square [0,1] by [0,1] 
  * a our domain. We know from the theory that the scheme is unconditionally stable when the 
  * magnetic Prandtl number Pr_m:=\nu/\nu_m is in betwen 1/2 and 2. For this particular test,
- * we are using viscosity \nu = 1 and magnetic resistivity \nu_m=1. (Q_2,Q_1) Taylor hood
- * stable pair were used
+ * we are using viscosity \nu = 1 and magnetic resistivity \nu_m=1. (Q_2,Q_1) Taylor Hood
+ * LBB stable pair were used.
  */
 
 
